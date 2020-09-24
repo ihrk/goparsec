@@ -1,68 +1,200 @@
 package goparsec
 
 import (
+	"math"
 	"unicode/utf8"
 )
 
-//Combinator is main parsing interface
-type Combinator interface {
-	//Parse returns number of matching bytes
-	//and possible error while parsing
-	//possible results:
-	//1) nonzero, nil - parsed successfully;
-	//2) n, error - parsed with error, number of bytes parsed must be ignored;
-	//3) 0, nil - failed to parse, but parsing was optional.
-	Parse([]byte) (int, error)
-	//Next returns number bytes that needs to be skipped to
-	//reach likely matching result.
-	Next([]byte) int
+type ParserFunc func([]byte) (int, error)
+
+//hack for mutually recursive parsers (see json example)
+type box struct {
+	f ParserFunc
 }
 
-func skipRune(input []byte) int {
+func NewBox() *box {
+	return &box{}
+}
+
+func (b *box) Wrap(pf ParserFunc) {
+	b.f = pf
+}
+
+func (b *box) Unwrap() ParserFunc {
+	return func(input []byte) (int, error) {
+		return b.f(input)
+	}
+}
+
+func Func(f func(rune) bool) ParserFunc {
+	return func(input []byte) (int, error) {
+		if len(input) == 0 {
+			return 0, EmptyInput
+		}
+
+		size := 1
+		r := rune(input[0])
+		if r >= utf8.RuneSelf {
+			r, size = utf8.DecodeRune(input)
+		}
+		if r == utf8.RuneError {
+			return 0, InvalidEncoding
+		}
+		if !f(r) {
+			return 0, WrongRune
+		}
+		return size, nil
+	}
+}
+
+func Rune(arg rune) ParserFunc {
+	return func(input []byte) (int, error) {
+		if len(input) == 0 {
+			return 0, EmptyInput
+		}
+
+		size := 1
+		r := rune(input[0])
+		if r >= utf8.RuneSelf {
+			r, size = utf8.DecodeRune(input)
+		}
+		if r == utf8.RuneError {
+			return 0, InvalidEncoding
+		}
+		if r != arg {
+			return 0, WrongRune
+		}
+		return size, nil
+	}
+}
+
+func Str(s string) ParserFunc {
+	return func(input []byte) (int, error) {
+
+		if len(input) == 0 {
+			return 0, EmptyInput
+		}
+
+		if len(input) >= len(s) && string(input[:len(s)]) == s {
+			return len(s), nil
+		}
+
+		return 0, NoMatch
+	}
+}
+
+func EOF(input []byte) (int, error) {
 	if len(input) == 0 {
-		return 0
+		return 0, nil
 	}
-	size := 1
-	if input[0] >= utf8.RuneSelf {
-		_, size = utf8.DecodeRune(input)
-	}
-	return size
+	return 0, NonEmptyInput
 }
 
-func FindAll(input []byte, comb Combinator) (res [][]byte) {
-	off := 0
-	for off < len(input) {
-		off += comb.Next(input[off:])
-		n, err := comb.Parse(input[off:])
-		if err != nil || n == 0 {
-			off += skipRune(input[off:])
-			continue
+//monadplus reference
+func Plus(pf1, pf2 ParserFunc) ParserFunc {
+	return func(input []byte) (int, error) {
+		if n, err := pf1(input); err == nil || n > 0 {
+			return n, err
 		}
-		res = append(res, input[off:off+n])
-		if n == 0 {
-			off += skipRune(input[off:])
-			continue
+		if n, err := pf2(input); err == nil || n > 0 {
+			return n, err
 		}
+		return 0, NoMatch
+	}
+}
+
+//same as Plus combinator, but for many parser funcs
+func Choice(pfs ...ParserFunc) ParserFunc {
+	return func(input []byte) (int, error) {
+		for i := range pfs {
+			n, err := pfs[i](input)
+			if err == nil || n > 0 {
+				return n, err
+			}
+		}
+		return 0, NoMatch
+	}
+}
+
+func Bind(pf1, pf2 ParserFunc) ParserFunc {
+	return func(input []byte) (int, error) {
+		var off int
+
+		n, err := pf1(input)
 		off += n
-	}
-	return
-}
 
-func FindAllString(input []byte, comb Combinator) (res []string) {
-	off := 0
-	for off < len(input) {
-		off += comb.Next(input[off:])
-		n, err := comb.Parse(input[off:])
 		if err != nil {
-			off += skipRune(input[off:])
-			continue
+			return off, err
 		}
-		res = append(res, string(input[off:off+n]))
-		if n == 0 {
-			off += skipRune(input[off:])
-			continue
-		}
+
+		n, err = pf2(input[off:])
 		off += n
+
+		return off, err
 	}
-	return
+}
+
+func Sequence(pfs ...ParserFunc) ParserFunc {
+	return func(input []byte) (int, error) {
+		var off int
+		for i := range pfs {
+			n, err := pfs[i](input[off:])
+			off += n
+			if err != nil {
+				return off, err
+			}
+		}
+		return off, nil
+	}
+}
+
+func Try(pf ParserFunc) ParserFunc {
+	return func(input []byte) (int, error) {
+		n, err := pf(input)
+		if err != nil {
+			return 0, err
+		}
+		return n, nil
+	}
+}
+
+func CountRange(min, max int, pf ParserFunc) ParserFunc {
+	return func(input []byte) (int, error) {
+		var off int
+		for i := 0; i < max; i++ {
+			n, err := pf(input[off:])
+			off += n
+			if err != nil {
+				if i < min {
+					return off, err
+				}
+				return off, nil
+			}
+		}
+		return off, nil
+	}
+}
+
+func Count(n int, pf ParserFunc) ParserFunc {
+	return CountRange(n, n, pf)
+}
+
+func Some(pf ParserFunc) ParserFunc {
+	return CountRange(1, math.MaxInt64, pf)
+}
+
+func Many(pf ParserFunc) ParserFunc {
+	return CountRange(0, math.MaxInt64, pf)
+}
+
+func Optional(pf ParserFunc) ParserFunc {
+	return CountRange(0, 1, pf)
+}
+
+func SepBy(val, sep ParserFunc) ParserFunc {
+	return Optional(SepBy1(val, sep))
+}
+
+func SepBy1(val, sep ParserFunc) ParserFunc {
+	return Sequence(val, Many(Bind(sep, val)))
 }

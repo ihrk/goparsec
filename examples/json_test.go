@@ -6,7 +6,7 @@ import (
 )
 
 func TestJsonGoparsec(t *testing.T) {
-	bts, err := jsonParser().Parse(testData)
+	bts, err := jsonParser()(testData)
 	if err != nil {
 		t.Errorf("\"%s\" %s", testData[:bts], err)
 	}
@@ -18,10 +18,10 @@ func BenchmarkJSONSTD(b *testing.B) {
 	}
 }
 
-func BenchmarkJSONGOP(b *testing.B) {
+func BenchmarkJSONGoparsec(b *testing.B) {
 	p := jsonParser()
 	for i := 0; i < b.N; i++ {
-		p.Parse(testData)
+		p(testData)
 	}
 }
 
